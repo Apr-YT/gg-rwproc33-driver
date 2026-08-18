@@ -3,6 +3,12 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/delay.h>
+#include <linux/random.h>
+/* 触摸反检测: 坐标/时长抖动模拟人手 (2026-08-18 D2) */
+#define GG_TAP_JITTER_RAW	300u	/* ±3px(raw 300/100) */
+#define GG_TAP_JITTER_MS	10u		/* ±10ms */
+#define GG_SWIPE_JITTER_RAW	200u	/* 滑点 ±2px */
+static inline uint32_t gg_jitter(uint32_t span) { if (!span) return 0; return (get_random_u32() % (span * 2 + 1)) - span; }
 
 #define MY_TASK_COMM_LEN 16
 
@@ -54,6 +60,10 @@ static int gg_touch_tap_raw(uint32_t x, uint32_t y, uint32_t hold_ms)
 {
 	if (!gg_touch_dev)
 		return -ENODEV;
+	/* 反检测: 坐标/时长抖动 */
+	x += gg_jitter(GG_TAP_JITTER_RAW);
+	y += gg_jitter(GG_TAP_JITTER_RAW);
+	hold_ms += gg_jitter(GG_TAP_JITTER_MS);
 	if (x >= GG_TOUCH_RAW_MAX_X) x = GG_TOUCH_RAW_MAX_X - 1;
 	if (y >= GG_TOUCH_RAW_MAX_Y) y = GG_TOUCH_RAW_MAX_Y - 1;
 
@@ -96,6 +106,9 @@ static int gg_touch_swipe_raw(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2
 	for (i = 1; i <= steps; i++) {
 		uint32_t cx = x1 + (uint32_t)(((uint64_t)(x2 - x1)) * i / steps);
 		uint32_t cy = y1 + (uint32_t)(((uint64_t)(y2 - y1)) * i / steps);
+		/* 反检测: 滑点 ±2px 抖动（轨迹自然, 非直线） */
+		cx += gg_jitter(GG_SWIPE_JITTER_RAW);
+		cy += gg_jitter(GG_SWIPE_JITTER_RAW);
 		input_report_abs(gg_touch_dev, ABS_MT_POSITION_X, cx);
 		input_report_abs(gg_touch_dev, ABS_MT_POSITION_Y, cy);
 		input_sync(gg_touch_dev);
@@ -143,10 +156,12 @@ static int gg_touch_register(void)
 	if (!gg_touch_dev)
 		return -ENOMEM;
 
-	gg_touch_dev->name = "gg-ghost";
-	gg_touch_dev->id.bustype = BUS_VIRTUAL;
-	gg_touch_dev->id.vendor = 0x0666;
-	gg_touch_dev->id.product = 0x0888;
+	/* 反检测: 伪装成真实触屏 focaltech_ts 参数（同型号第二块屏, 设备枚举不可区分） */
+	gg_touch_dev->name = "focaltech_ts";
+	gg_touch_dev->id.bustype = 0x001c;
+	gg_touch_dev->id.vendor = 0x0000;
+	gg_touch_dev->id.product = 0x0000;
+	gg_touch_dev->id.version = 0x0000;
 
 	set_bit(EV_KEY, gg_touch_dev->evbit);
 	set_bit(BTN_TOUCH, gg_touch_dev->keybit);
