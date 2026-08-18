@@ -236,6 +236,136 @@ static ssize_t OnCmdInstProcessHwbp(struct ioctl_request *hdr, char __user* buf)
 	return 0;
 }
 
+/* 对进程全部线程批量安装硬件断点（通用入口, CMD_INST_PROCESS_HWBP_ALL=13）。
+ * 驱动内 for_each_thread 枚举全部线程, 每线程注册一个 per-task 断点
+ * （任务切换自动换装 debug 寄存器, 不受每 CPU WRP 4 槽限制）。
+ * 入参: param1=handle(pid_struct*), param2=addr, param3=(len | type<<8)
+ * 返回: buf[0..4)=注册数 N, buf[4..4+8N)=perf_event* 句柄数组。成功 0, 失败负 errno。 */
+static ssize_t OnCmdInstAllProcessHwbp(struct ioctl_request *hdr, char __user* buf) {
+	struct pid * proc_pid_struct = (struct pid *)hdr->param1;
+	uint64_t proc_virt_addr = hdr->param2;
+	char hwbp_len  = hdr->param3 & 0xFF;
+	char hwbp_type = (hdr->param3 >> 8) & 0xFF;
+	pid_t pid_val;
+	struct task_struct *leader, *task;
+	struct task_struct **tasks;	/* RCU 内收集的 task 引用（RCU 外逐个注册） */
+	uint64_t *bp_ids;
+	unsigned long flags;
+	int n = 0, ntasks = 0, max_all = HWBP_MAX_HANDLES;
+	int i, j;
+
+	if (!proc_pid_struct) {
+		return -EINVAL;
+	}
+	pid_val = pid_nr(proc_pid_struct);
+	if (!pid_val) {
+		return -EINVAL;
+	}
+	leader = pid_task(proc_pid_struct, PIDTYPE_TGID);
+	if (!leader) {
+		printk_debug(KERN_INFO "CMD_INST_ALL pid %d leader not found\n", pid_val);
+		return -EINVAL;
+	}
+
+	bp_ids = (uint64_t *)vmalloc(sizeof(uint64_t) * max_all);
+	if (!bp_ids) {
+		return -ENOMEM;
+	}
+	/* ⚠️ 两阶段注册: for_each_thread 需 RCU 读锁, 但 vmalloc/register_user_hw_breakpoint
+	 * 会睡眠 → RCU 锁内调用 = "scheduling while atomic" → PANIC_ON_OOPS 整机重启
+	 * （2026-08-18 真机复现）。故 RCU 内只收集 task 引用, RCU 外逐个注册。 */
+	tasks = (struct task_struct **)vmalloc(sizeof(*tasks) * max_all);
+	if (!tasks) {
+		vfree(bp_ids);
+		return -ENOMEM;
+	}
+	ntasks = 0;
+
+	rcu_read_lock();
+	for_each_thread(leader, task) {
+		if (ntasks >= max_all) {
+			break;
+		}
+		get_task_struct(task);
+		tasks[ntasks++] = task;
+	}
+	rcu_read_unlock();
+
+	for (i = 0; i < ntasks; i++) {
+		struct HWBP_HANDLE_INFO *slot = NULL;
+		struct perf_event *bp;
+		task = tasks[i];
+
+		/* 找空槽并立即占用（锁内预留, 与单线程 INST 同一契约） */
+		raw_spin_lock_irqsave(&g_hwbp_lock, flags);
+		for (j = 0; j < HWBP_MAX_HANDLES; j++) {
+			if (!g_hwbp_handles[j].in_use) {
+				slot = &g_hwbp_handles[j];
+				memset(slot, 0, sizeof(*slot));
+				slot->in_use = true;
+				break;
+			}
+		}
+		raw_spin_unlock_irqrestore(&g_hwbp_lock, flags);
+		if (!slot) {
+			break;	/* 全部槽位占用 */
+		}
+
+		slot->task_id = task_pid_nr(task);
+		slot->is_32bit_task = is_compat_thread(task_thread_info(task));
+		ptrace_breakpoint_init(&slot->original_attr);
+		slot->original_attr.bp_addr = proc_virt_addr;
+		slot->original_attr.bp_len = hwbp_len;
+		slot->original_attr.bp_type = hwbp_type;
+		slot->original_attr.disabled = 0;
+
+		slot->hit_arr = vmalloc(sizeof(struct HWBP_HIT_ITEM) * HWBP_HIT_CAP);
+		if (!slot->hit_arr) {
+			raw_spin_lock_irqsave(&g_hwbp_lock, flags);
+			slot->in_use = false;
+			raw_spin_unlock_irqrestore(&g_hwbp_lock, flags);
+			continue;
+		}
+		memset(slot->hit_arr, 0, sizeof(struct HWBP_HIT_ITEM) * HWBP_HIT_CAP);
+
+		bp = x_register_user_hw_breakpoint(&slot->original_attr, hwbp_handler, NULL, task);
+		if (IS_ERR((void __force *)bp)) {
+			int ret = PTR_ERR((void __force *)bp);
+			raw_spin_lock_irqsave(&g_hwbp_lock, flags);
+			slot->in_use = false;
+			raw_spin_unlock_irqrestore(&g_hwbp_lock, flags);
+			vfree(slot->hit_arr);
+			slot->hit_arr = NULL;
+			slot->sample_hbp = NULL;
+			printk_debug(KERN_INFO "CMD_INST_ALL tid %d register failed: %d\n",
+				task_pid_nr(task), ret);
+			continue;	/* 单个线程失败跳过, 尽量全注册 */
+		}
+		slot->sample_hbp = bp;
+		bp_ids[n++] = (uint64_t)bp;
+	}
+
+	/* 释放 task 引用（注册成功者 x_register_user_hw_breakpoint 已自持引用） */
+	for (i = 0; i < ntasks; i++) {
+		put_task_struct(tasks[i]);
+	}
+	vfree(tasks);
+
+	if (!!x_copy_to_user((void*)buf, (void*)&n, sizeof(int))) {
+		vfree(bp_ids);
+		return -EINVAL;
+	}
+	if (n > 0 && !!x_copy_to_user((void*)(buf + sizeof(int)), (void*)bp_ids,
+					n * sizeof(uint64_t))) {
+		vfree(bp_ids);
+		return -EINVAL;
+	}
+	vfree(bp_ids);
+	printk_debug(KERN_INFO "CMD_INST_ALL pid %d addr %px len %d type %d -> %d/%d threads\n",
+		pid_val, (void*)proc_virt_addr, hwbp_len, hwbp_type, n, ntasks);
+	return 0;
+}
+
 static ssize_t OnCmdUninstProcessHwbp(struct ioctl_request *hdr, char __user* buf) {
 	struct perf_event * sample_hbp = (struct perf_event *)hdr->param1;
 	struct HWBP_HANDLE_INFO *slot = NULL;
@@ -431,6 +561,8 @@ static inline ssize_t DispatchCommand(struct ioctl_request *hdr, char __user* bu
 		return OnCmdGetCpuNumWrps(hdr, buf);
 	case CMD_INST_PROCESS_HWBP:
 		return OnCmdInstProcessHwbp(hdr, buf);
+	case CMD_INST_PROCESS_HWBP_ALL:
+		return OnCmdInstAllProcessHwbp(hdr, buf);
 	case CMD_UNINST_PROCESS_HWBP:
 		return OnCmdUninstProcessHwbp(hdr, buf);
 	case CMD_SUSPEND_PROCESS_HWBP:
@@ -473,12 +605,29 @@ static ssize_t hwBreakpointProc_read(struct file* filp,
     return DispatchCommand(&hdr, buf + header_size);
 }
 
-/* 卸载全部断点（release / 模块退出）。vfree 与 unregister 均放在锁外。 */
+/* 卸载全部断点（release / 模块退出）。vfree 与 unregister 均放在锁外。
+ * 数组动态分配（HWBP_MAX_HANDLES=128 后静态数组超内核栈 2KB 限制）。 */
 static void clean_hwbp(void) {
-	struct perf_event *bps[HWBP_MAX_HANDLES];
-	struct HWBP_HIT_ITEM *arrs[HWBP_MAX_HANDLES];
+	struct perf_event **bps;
+	struct HWBP_HIT_ITEM **arrs;
 	unsigned long flags;
 	int i, n = 0;
+
+	bps = vmalloc(sizeof(*bps) * HWBP_MAX_HANDLES);
+	arrs = vmalloc(sizeof(*arrs) * HWBP_MAX_HANDLES);
+	if (!bps || !arrs) {
+		/* 极端 OOM: 锁内直接清 in_use, 断点/缓冲由模块退出回收 */
+		vfree(bps);
+		vfree(arrs);
+		raw_spin_lock_irqsave(&g_hwbp_lock, flags);
+		for (i = 0; i < HWBP_MAX_HANDLES; i++) {
+			g_hwbp_handles[i].in_use = false;
+			g_hwbp_handles[i].sample_hbp = NULL;
+			g_hwbp_handles[i].hit_arr = NULL;
+		}
+		raw_spin_unlock_irqrestore(&g_hwbp_lock, flags);
+		return;
+	}
 
 	raw_spin_lock_irqsave(&g_hwbp_lock, flags);
 	for (i = 0; i < HWBP_MAX_HANDLES; i++) {
@@ -497,6 +646,8 @@ static void clean_hwbp(void) {
 		if (arrs[i]) vfree(arrs[i]);
 		if (bps[i]) x_unregister_hw_breakpoint(bps[i]);
 	}
+	vfree(bps);
+	vfree(arrs);
 }
 
 static int hwBreakpointProc_release(struct inode *inode, struct file *filp) {

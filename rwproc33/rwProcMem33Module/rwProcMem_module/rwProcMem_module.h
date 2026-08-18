@@ -43,7 +43,24 @@ enum {
 	CMD_GET_PROCESS_RSS,			// 获取进程的物理内存占用大小
 	CMD_GET_PROCESS_CMDLINE_ADDR,	// 获取进程cmdline的内存地址
 	CMD_HIDE_KERNEL_MODULE,			// 隐藏驱动
+	CMD_GGTOUCH_TAP = 15,			// 内核虚拟触摸: 单点 tap（display 坐标）
+	CMD_GGTOUCH_SWIPE = 16,			// 内核虚拟触摸: 滑动 swipe（display 坐标）
 };
+
+//////////////////////////////////////////////////////////////////
+// 触摸注入参数（与用户态 agentd 共享的协议结构）
+#pragma pack(push,1)
+struct gg_touch_tap {
+	uint32_t x;			// display 坐标 X（横屏 2608x1200 逻辑像素）
+	uint32_t y;			// display 坐标 Y
+	uint32_t hold_ms;	// 按下保持毫秒数（0 用默认 120ms）
+};
+struct gg_touch_swipe {
+	uint32_t x1, y1;	// 起点 display 坐标
+	uint32_t x2, y2;	// 终点 display 坐标
+	uint32_t ms;		// 滑动总时长毫秒
+};
+#pragma pack(pop)
 
 //////////////////////////////////////////////////////////////////
 //rwProcMemDev设备结构体

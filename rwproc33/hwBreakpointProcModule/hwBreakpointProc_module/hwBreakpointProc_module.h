@@ -46,6 +46,7 @@ enum {
 	CMD_GET_HWBP_HIT_DETAIL = 10,	// 获取硬件断点命中详细信息
 	CMD_SET_HOOK_PC = 11,			// 设置无条件Hook跳转
 	CMD_HIDE_KERNEL_MODULE = 12,	// 隐藏驱动
+	CMD_INST_PROCESS_HWBP_ALL = 13,	// 对进程全部线程批量安装硬件断点（驱动内 for_each_thread 枚举）
 };
 
 struct hwBreakpointProcDev {
@@ -82,9 +83,11 @@ struct HWBP_HIT_ITEM {
 #pragma pack()
 
 /* 命中记录上限（与上游 MIN_LEN 一致; agentd 按此做索引去重, 不可随意改小） */
-#define HWBP_HIT_CAP 1024
-/* 最大并发断点句柄数（固定槽位数组, 避免 IRQ 上下文动态分配） */
-#define HWBP_MAX_HANDLES 16
+#define HWBP_HIT_CAP 512
+/* 最大并发断点句柄数（固定槽位数组, 避免 IRQ 上下文动态分配）。
+ * 2026-08-18 通用化: 16 → 128 —— CMD_INST_PROCESS_HWBP_ALL 全线程注册,
+ * 游戏进程线程数可达 70+, 槽位必须覆盖全部线程（per-task 断点每线程独立 debug 槽）。 */
+#define HWBP_MAX_HANDLES 128
 
 /*
  * 断点句柄。存储设计（6.12 修复）:

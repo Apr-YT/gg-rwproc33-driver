@@ -39,7 +39,8 @@ static struct task_struct *x_get_current(void) {
 }
 
 static void * x_kmalloc(size_t size, gfp_t flags) {
-	return __kmalloc(size, flags);
+	/* 6.12 内核 __kmalloc 宏签名已变，用公开 kmalloc 接口 */
+	return kmalloc(size, flags);
 }
 
 static unsigned long x_copy_from_user(void *to, const void __user *from, unsigned long n) {

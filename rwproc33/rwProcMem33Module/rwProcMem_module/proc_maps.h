@@ -2779,7 +2779,7 @@ out:
 #endif
 
 
-#if MY_LINUX_VERSION_CODE == KERNEL_VERSION(6,6,30)
+#if MY_LINUX_VERSION_CODE == KERNEL_VERSION(6,6,30) || MY_LINUX_VERSION_CODE >= KERNEL_VERSION(6,12,0)
 #include <linux/mm_inline.h>
 struct anon_vma_name * __weak anon_vma_name(struct vm_area_struct* vma) {
 	return NULL;

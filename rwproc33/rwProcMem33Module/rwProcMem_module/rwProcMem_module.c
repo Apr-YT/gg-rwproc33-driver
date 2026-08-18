@@ -1,5 +1,9 @@
 ﻿#include "rwProcMem_module.h"
 
+#include <linux/input.h>
+#include <linux/input/mt.h>
+#include <linux/delay.h>
+
 #define MY_TASK_COMM_LEN 16
 
 #pragma pack(push,1)
@@ -22,6 +26,151 @@ struct arg_info {
 	uint64_t arg_end;
 };
 #pragma pack(pop)
+
+//////////////////////////////////////////////////////////////////////////
+// 内核虚拟触摸（GG-TOUCH）
+// 通过 input 子系统注册虚拟触摸设备，ioctl/read 命令触发 input_event()
+// 注入，事件流与真实触屏一致：input core → evdev → InputReader → 应用。
+// 坐标空间与 focaltech_ts 相同（raw 120000x260800 = display 1200x2608 的 100 倍）。
+#define GG_TOUCH_DISP_W		2608	// 横屏 display 宽
+#define GG_TOUCH_DISP_H		1200	// 横屏 display 高
+#define GG_TOUCH_RAW_MAX_X	120000u	// raw X 上限（display 短边 1200 * 100）
+#define GG_TOUCH_RAW_MAX_Y	260800u	// raw Y 上限（display 长边 2608 * 100）
+#define GG_TOUCH_MAX_SLOTS	10		// 最大触点（与真实触屏一致）
+
+static struct input_dev *gg_touch_dev = NULL;
+
+// display(横屏 2608x1200) → raw(竖屏 1200x2608 * 100)：设备 CCW 旋转 90°
+static void gg_disp2raw(uint32_t dx, uint32_t dy, uint32_t *rx, uint32_t *ry)
+{
+	if (dx >= GG_TOUCH_DISP_W) dx = GG_TOUCH_DISP_W - 1;
+	if (dy >= GG_TOUCH_DISP_H) dy = GG_TOUCH_DISP_H - 1;
+	*rx = GG_TOUCH_RAW_MAX_X - dy * 100u;
+	*ry = dx * 100u;
+}
+
+// 单点 tap（raw 坐标）
+static int gg_touch_tap_raw(uint32_t x, uint32_t y, uint32_t hold_ms)
+{
+	if (!gg_touch_dev)
+		return -ENODEV;
+	if (x >= GG_TOUCH_RAW_MAX_X) x = GG_TOUCH_RAW_MAX_X - 1;
+	if (y >= GG_TOUCH_RAW_MAX_Y) y = GG_TOUCH_RAW_MAX_Y - 1;
+
+	input_mt_slot(gg_touch_dev, 0);
+	input_mt_report_slot_state(gg_touch_dev, MT_TOOL_FINGER, true);
+	input_report_key(gg_touch_dev, BTN_TOUCH, 1);
+	input_report_abs(gg_touch_dev, ABS_MT_POSITION_X, x);
+	input_report_abs(gg_touch_dev, ABS_MT_POSITION_Y, y);
+	input_sync(gg_touch_dev);
+
+	if (hold_ms)
+		msleep(hold_ms);
+
+	input_mt_report_slot_state(gg_touch_dev, MT_TOOL_FINGER, false);
+	input_report_key(gg_touch_dev, BTN_TOUCH, 0);
+	input_sync(gg_touch_dev);
+	return 0;
+}
+
+// 滑动（raw 坐标，线性插值）
+static int gg_touch_swipe_raw(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t ms)
+{
+	const int steps = 20;
+	int i;
+
+	if (!gg_touch_dev)
+		return -ENODEV;
+	if (x1 >= GG_TOUCH_RAW_MAX_X) x1 = GG_TOUCH_RAW_MAX_X - 1;
+	if (y1 >= GG_TOUCH_RAW_MAX_Y) y1 = GG_TOUCH_RAW_MAX_Y - 1;
+	if (x2 >= GG_TOUCH_RAW_MAX_X) x2 = GG_TOUCH_RAW_MAX_X - 1;
+	if (y2 >= GG_TOUCH_RAW_MAX_Y) y2 = GG_TOUCH_RAW_MAX_Y - 1;
+
+	input_mt_slot(gg_touch_dev, 0);
+	input_mt_report_slot_state(gg_touch_dev, MT_TOOL_FINGER, true);
+	input_report_key(gg_touch_dev, BTN_TOUCH, 1);
+	input_report_abs(gg_touch_dev, ABS_MT_POSITION_X, x1);
+	input_report_abs(gg_touch_dev, ABS_MT_POSITION_Y, y1);
+	input_sync(gg_touch_dev);
+
+	for (i = 1; i <= steps; i++) {
+		uint32_t cx = x1 + (uint32_t)(((uint64_t)(x2 - x1)) * i / steps);
+		uint32_t cy = y1 + (uint32_t)(((uint64_t)(y2 - y1)) * i / steps);
+		input_report_abs(gg_touch_dev, ABS_MT_POSITION_X, cx);
+		input_report_abs(gg_touch_dev, ABS_MT_POSITION_Y, cy);
+		input_sync(gg_touch_dev);
+		msleep(ms / steps);
+	}
+
+	input_mt_report_slot_state(gg_touch_dev, MT_TOOL_FINGER, false);
+	input_report_key(gg_touch_dev, BTN_TOUCH, 0);
+	input_sync(gg_touch_dev);
+	return 0;
+}
+
+static ssize_t OnCmdGgTouchTap(struct ioctl_request *hdr, char __user* buf) {
+	struct gg_touch_tap arg;
+	uint32_t rx, ry;
+
+	if (hdr->buf_size != sizeof(arg))
+		return -EINVAL;
+	if (x_copy_from_user(&arg, buf, sizeof(arg)))
+		return -EFAULT;
+
+	gg_disp2raw(arg.x, arg.y, &rx, &ry);
+	printk_debug(KERN_INFO "CMD_GGTOUCH_TAP disp(%u,%u) hold=%ums\n", arg.x, arg.y, arg.hold_ms);
+	return gg_touch_tap_raw(rx, ry, arg.hold_ms ? arg.hold_ms : 120);
+}
+
+static ssize_t OnCmdGgTouchSwipe(struct ioctl_request *hdr, char __user* buf) {
+	struct gg_touch_swipe arg;
+	uint32_t rx1, ry1, rx2, ry2;
+
+	if (hdr->buf_size != sizeof(arg))
+		return -EINVAL;
+	if (x_copy_from_user(&arg, buf, sizeof(arg)))
+		return -EFAULT;
+
+	gg_disp2raw(arg.x1, arg.y1, &rx1, &ry1);
+	gg_disp2raw(arg.x2, arg.y2, &rx2, &ry2);
+	printk_debug(KERN_INFO "CMD_GGTOUCH_SWIPE (%u,%u)->(%u,%u) %ums\n", arg.x1, arg.y1, arg.x2, arg.y2, arg.ms);
+	return gg_touch_swipe_raw(rx1, ry1, rx2, ry2, arg.ms ? arg.ms : 300);
+}
+
+static int gg_touch_register(void)
+{
+	gg_touch_dev = input_allocate_device();
+	if (!gg_touch_dev)
+		return -ENOMEM;
+
+	gg_touch_dev->name = "gg-ghost";
+	gg_touch_dev->id.bustype = BUS_VIRTUAL;
+	gg_touch_dev->id.vendor = 0x0666;
+	gg_touch_dev->id.product = 0x0888;
+
+	set_bit(EV_KEY, gg_touch_dev->evbit);
+	set_bit(BTN_TOUCH, gg_touch_dev->keybit);
+	set_bit(EV_ABS, gg_touch_dev->evbit);
+	input_set_abs_params(gg_touch_dev, ABS_MT_POSITION_X, 0, GG_TOUCH_RAW_MAX_X - 1, 0, 0);
+	input_set_abs_params(gg_touch_dev, ABS_MT_POSITION_Y, 0, GG_TOUCH_RAW_MAX_Y - 1, 0, 0);
+	input_mt_init_slots(gg_touch_dev, GG_TOUCH_MAX_SLOTS, 0);
+
+	if (input_register_device(gg_touch_dev)) {
+		input_free_device(gg_touch_dev);
+		gg_touch_dev = NULL;
+		return -EIO;
+	}
+	printk(KERN_EMERG "gg-ghost: virtual input device registered\n");
+	return 0;
+}
+
+static void gg_touch_unregister(void)
+{
+	if (gg_touch_dev) {
+		input_unregister_device(gg_touch_dev);
+		gg_touch_dev = NULL;
+	}
+}
 
 static ssize_t OnCmdInitDeviceInfo(struct ioctl_request *hdr, char __user* buf) {
 	long err = 0;
@@ -300,6 +449,10 @@ static inline ssize_t DispatchCommand(struct ioctl_request *hdr, char __user* bu
 		return OnCmdGetProcessCmdlineAddr(hdr, buf);
 	case CMD_HIDE_KERNEL_MODULE:
 		return OnCmdHideKernelModule(hdr, buf);
+	case CMD_GGTOUCH_TAP:
+		return OnCmdGgTouchTap(hdr, buf);
+	case CMD_GGTOUCH_SWIPE:
+		return OnCmdGgTouchSwipe(hdr, buf);
 	default:
 		return -EINVAL;
 	}
@@ -329,6 +482,14 @@ static ssize_t rwProcMem_read(struct file* filp,
 }
 
 static int rwProcMem_dev_init(void) {
+	int err;
+
+	err = gg_touch_register();
+	if (err) {
+		printk(KERN_EMERG "gg-touch: register failed (%d)\n", err);
+		return err;
+	}
+
 	g_rwProcMem_devp = x_kmalloc(sizeof(struct rwProcMemDev), GFP_KERNEL);
 	memset(g_rwProcMem_devp, 0, sizeof(struct rwProcMemDev));
 
@@ -366,6 +527,7 @@ static void rwProcMem_dev_exit(void) {
 	}
 	stop_hide_procfs_dir();
 #endif
+	gg_touch_unregister();
 	kfree(g_rwProcMem_devp);
 	printk(KERN_EMERG "Goodbye\n");
 }
