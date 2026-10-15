@@ -1,0 +1,16 @@
+# 源码：一律 LF 入库（带 shebang 的脚本若带 CR 会在 Linux 端报 bad interpreter）
+*.py    text eol=lf
+*.sh    text eol=lf
+
+# Windows 侧脚本
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制资产：禁止任何行尾 / 编码转换
+*.png   binary
+*.exe   binary
+*.ko    binary
+*.bin   binary
+*.elf   binary
+*.7z    binary
